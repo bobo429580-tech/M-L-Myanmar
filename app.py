@@ -1,0 +1,209 @@
+﻿import streamlit as st
+import fitz
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import Chroma
+from langchain.chains import RetrievalQA, ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
+import streamlit_authenticator as stauth
+import yaml
+import os
+from dotenv import load_dotenv
+import tempfile
+import time
+
+
+st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
+
+
+load_dotenv()
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Myanmar:wght@400;700&display=swap');
+    html, body, [class*="css"]  { font-family: 'Noto Sans Myanmar', sans-serif; }
+    </style>
+""", unsafe_allow_html=True)
+
+
+# config.yaml ဖတ်ရန်
+with open('config.yaml') as file:
+    config = yaml.safe_load(file)
+
+
+authenticator = stauth.Authenticate(
+    config['credentials'],
+    config['cookie']['name'],
+    config['cookie']['key'],
+    config['cookie']['expiry_days']
+)
+
+
+@st.cache_resource(ttl=300)
+def init_session():
+    defaults = {
+        'player_name': '', 'lives': 3, 'gold': 0, 'inventory': {},
+        'current_chapter': 0, 'docs': [], 'vectorstore': None,
+        'game_over': False, 'chat_mode': False
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state: st.session_state[k] = v
+init_session()
+
+
+# === ADMIN PANEL (PASSWORD + APPROVAL SYSTEM) ===
+ADMIN_PASSWORD = "admin2025"  # ပြောင်းလို့ရပါတယ်
+
+
+if 'admin_unlocked' not in st.session_state:
+    st.session_state.admin_unlocked = False
+
+
+if st.sidebar.button("Admin Panel ဖွင့်ရန်"):
+    pwd = st.sidebar.text_input("Admin ပတ်စ်ဝါဒ်", type="password")
+    if pwd == ADMIN_PASSWORD:
+        st.session_state.admin_unlocked = True
+        st.sidebar.success("ဖွင့်ပြီး!")
+    elif pwd:
+        st.sidebar.error("မှား!")
+
+
+if st.session_state.admin_unlocked:
+    st.sidebar.subheader("အကောင့်စီမံရေး")
+    for user, data in config['credentials']['usernames'].items():
+        if data.get('status') != 'admin':
+            status = data.get('status', 'pending')
+            col1, col2, col3 = st.sidebar.columns([2, 1, 1])
+            with col1:
+                st.write(f"@{user} ({status})")
+            with col2:
+                if st.button("ခွင့်ပြု", key=f"approve_{user}"):
+                    config['credentials']['usernames'][user]['status'] = 'approved'
+                    st.sidebar.success(f"@{user} ခွင့်ပြုပြီး!")
+            with col3:
+                if st.button("ပယ်", key=f"reject_{user}"):
+                    config['credentials']['usernames'][user]['status'] = 'rejected'
+                    st.sidebar.error(f"@{user} ပယ်ချပြီး!")
+
+
+# === ကစားသူ ဝင်ရောက်မှု ===
+name, auth_status, username = authenticator.login('main')
+if auth_status:
+    user_status = config['credentials']['usernames'].get(username, {}).get('status', 'pending')
+
+
+    if user_status == 'admin':
+        st.success(f"Admin: {name} (@{username})")
+        st.info("အကောင့်စီမံရေး အတွက် Admin Panel သုံးပါ")
+    elif user_status == 'approved':
+        st.success(f"မင်္ဂလာပါ {name} (@{username})")
+        st.title("မြန်မာ PDF ဝတ္ထု RPG (18+)")
+
+
+        if not st.session_state.player_name:
+            st.session_state.player_name = st.text_input("ဂိမ်းထဲ နာမည်?")
+            if st.session_state.player_name: st.rerun()
+
+
+        st.write(f"**{st.session_state.player_name}** | ❤️ {st.session_state.lives} | 💰 {st.session_state.gold}")
+
+
+        with st.expander("ပစ္စည်း (၁၀ ပစ္စည်း)"):
+            for item, qty in list(st.session_state.inventory.items())[:10]:
+                st.write(f"• {item}: {qty}")
+            if st.button("ငွေ +100"): st.session_state.gold += 100; st.rerun()
+
+
+        uploaded_file = st.file_uploader("PDF ထည့်ပါ (500MB)", type="pdf")
+        if uploaded_file and uploaded_file.size <= 500*1024*1024:
+            start = time.time()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded_file.getvalue())
+                tmp_path = tmp.name
+            loader = PyMuPDFLoader(tmp_path)
+            docs = loader.load(); os.unlink(tmp_path)
+            splits = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200).split_documents(docs)
+            st.session_state.docs.extend(splits)
+            st.session_state.vectorstore = Chroma.from_documents(splits, OpenAIEmbeddings())
+            st.success(f"PDF ထည့်ပြီး! ({time.time()-start:.2f}s)")
+
+
+        if st.button("ဂိမ်း စပါ!") and st.session_state.vectorstore and not st.session_state.game_over:
+            start = time.time()
+            chapter = st.session_state.docs[st.session_state.current_chapter]
+            st.subheader(f"ခန်း {st.session_state.current_chapter + 1}")
+            st.write(chapter.page_content[:1000] + "...")
+
+
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=150)
+            q_prompt = PromptTemplate(
+                template="ဒီ အပိုင်းကနေ မေးခွန်း ၅ ခု ထုတ်ပါ။ 18+ ရှိရင် စုံလင်ပြန်ရေး။ မြန်မာလို။\n{context}",
+                input_variables=["context"]
+            )
+            qa_chain = RetrievalQA.from_chain_type(llm, retriever=st.session_state.vectorstore.as_retriever(), chain_type_kwargs={"prompt": q_prompt})
+            questions = qa_chain.run(chapter.page_content[:1500]).split('\n')[:5]
+            score = 0
+            for i, q in enumerate(questions):
+                ans = st.text_input(f"Q{i+1}: {q}", key=f"q{i}")
+                if ans:
+                    check_start = time.time()
+                    check = llm.invoke(f"မေးခွန်း: {q}\nအဖြေ: {ans}\nဝတ္ထု: {chapter.page_content[:500]}\n18+ ရှိရင် စုံလင်ပြန်ရေး။ မှန်/မှား ပြော။").content
+                    st.write(f"{check} ({time.time()-check_start:.2f}s)")
+                    if "မှန်" in check: score += 1
+                    else: st.session_state.lives -= 1; st.error("မှား! -1")
+
+
+            if st.session_state.lives <= 0:
+                st.session_state.game_over = True
+                st.error("ဂိမ်း OVER!")
+            elif score == 5:
+                branch = llm.invoke(f"အဖြေ: {ans} အပေါ် ဇာတ်လမ်း ပြောင်း။ 18+ ရှိရင် စုံလင်ပြန်ရေး။ မြန်မာ။").content
+                st.write(f"**နောက်ခန်း:** {branch}")
+                st.session_state.current_chapter += 1
+                if st.session_state.current_chapter >= len(st.session_state.docs):
+                    st.session_state.chat_mode = True
+                    st.success("အောင်ပြီ! ဇာတ်ကောင် နဲ့ စကားပြော")
+            st.write(f"ခန်း ပြီး! ({time.time()-start:.2f}s)"); st.rerun()
+
+
+        if st.button("နောက် PDF / ပြန်စ"):
+            for k in ['docs','vectorstore','current_chapter','game_over','chat_mode']:
+                if k in st.session_state: del st.session_state[k]
+            st.session_state.lives = 3; st.session_state.inventory = {}; st.session_state.gold = 0
+            st.rerun()
+
+
+        if st.session_state.chat_mode:
+            st.subheader("ဇာတ်ကောင် နဲ့ စကားပြော (18+)")
+            memory = ConversationBufferMemory()
+            convo = ConversationalRetrievalChain.from_llm(ChatOpenAI(model="gpt-4o-mini"), st.session_state.vectorstore.as_retriever(), memory=memory)
+            if "msgs" not in st.session_state: st.session_state.msgs = []
+            for m in st.session_state.msgs:
+                with st.chat_message(m["role"]): st.markdown(m["content"])
+            if prompt := st.chat_input("ဘာပြောမလဲ?"):
+                start = time.time()
+                st.session_state.msgs.append({"role": "user", "content": prompt})
+                with st.chat_message("user"): st.markdown(prompt)
+                res = convo({"question": prompt})["answer"]
+                st.session_state.msgs.append({"role": "assistant", "content": res})
+                with st.chat_message("assistant"): st.markdown(res)
+                st.write(f"({time.time()-start:.2f}s)")
+
+
+        authenticator.logout('main', 'ထွက်ရန်')
+
+
+    elif user_status == 'pending':
+        st.warning(f"@{username} အကောင့် စာရင်းသွင်းပြီးပါပြီ။")
+        st.info("Admin ခွင့်ပြုချက် စောင့်ပါ။ ခွင့်ပြုပြီးရင် ဂိမ်းဆော့နိုင်ပါပြီ။")
+    elif user_status == 'rejected':
+        st.error(f"@{username} အကောင့် ပယ်ချခံရပါသည်။")
+        st.info("အခြား အကောင့်ဖြင့် ကြိုးစားပါ။")
+
+
+else:
+    st.info("အကောင့် ဝင်ပါ။ စာရင်းမသွင်းရသေးရင် config.yaml ထဲ ထည့်ပါ။")
