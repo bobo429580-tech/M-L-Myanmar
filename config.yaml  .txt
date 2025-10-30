@@ -1,0 +1,23 @@
+﻿credentials:
+  usernames:
+    player1:
+      email: player1@example.com
+      name: ကစားသူ ၁
+      password: player123
+      status: pending    # အသစ်ထည့်ထားတယ်!
+    player2:
+      email: player2@example.com
+      name: ကစားသူ ၂
+      password: player123
+      status: approved   # Admin ခွင့်ပြုပြီး
+    admin:
+      email: admin@example.com
+      name: Admin
+      password: ZxcvbnmAk10
+      status: admin      # Admin အတွက်
+
+
+cookie:
+  name: rpg_game_cookie
+  key: super_secret_key_123
+  expiry_days: 30
